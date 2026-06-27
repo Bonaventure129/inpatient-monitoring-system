@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Conrad Robotics — Patient Monitor</title>
+<style>
+  :root {
+    --bg:        #0a0f1a;
+    --card:      #111827;
+    --border:    #1e2d45;
+    --text:      #e2e8f0;
+    --muted:     #64748b;
+    --green:     #22c55e;
+    --red:       #ef4444;
+    --blue:      #3b82f6;
+    --orange:    #f97316;
+    --yellow:    #eab308;
+    --ecg-green: #00ff88;
+    --radius:    12px;
+    --shadow:    0 4px 24px rgba(0,0,0,0.5);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+    padding: 20px;
+  }
+
+  /* ---- HEADER ---- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand svg { width: 36px; height: 36px; }
+  .brand h1 { font-size: 1.3rem; font-weight: 700; letter-spacing: 0.02em; }
+  .brand p  { font-size: 0.75rem; color: var(--muted); }
+  .status-pill {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--border);
+    font-size: 0.8rem;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+    transition: background 0.4s;
+  }
+  .dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.lost { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+
+  /* ---- GRID ---- */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr 1fr; } }
+
+  /* ---- CARDS ---- */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    box-shadow: var(--shadow);
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s;
+  }
+  .card.alert {
+    border-color: var(--red);
+    animation: alertPulse 1s ease-in-out infinite alternate;
+  }
+  @keyframes alertPulse {
+    from { box-shadow: 0 0 0 rgba(239,68,68,0.3); }
+    to   { box-shadow: 0 0 20px rgba(239,68,68,0.5); }
+  }
+  .card-label {
+    font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px;
+  }
+  .card-value {
+    font-size: 2.8rem; font-weight: 800; line-height: 1;
+    transition: color 0.4s;
+  }
+  .card-unit {
+    font-size: 0.9rem; color: var(--muted);
+    margin-left: 4px; font-weight: 400;
+  }
+  .card-icon {
+    position: absolute; top: 16px; right: 16px;
+    font-size: 1.6rem; opacity: 0.15;
+  }
+  .card-bar {
+    height: 4px; border-radius: 2px;
+    background: var(--border);
+    margin-top: 12px; overflow: hidden;
+  }
+  .card-bar-fill {
+    height: 100%; border-radius: 2px;
+    transition: width 0.5s ease;
+  }
+
+  /* Colours per card */
+  .hr-val   { color: #f87171; }
+  .spo2-val { color: #60a5fa; }
+  .temp-val { color: #fb923c; }
+  .ecg-val  { color: var(--ecg-green); }
+
+  /* ---- ECG CARD ---- */
+  .ecg-card {
+    grid-column: 1 / -1;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    box-shadow: var(--shadow);
+  }
+  .ecg-card .card-label { margin-bottom: 12px; }
+  canvas#ecgCanvas {
+    width: 100%; height: 150px;
+    display: block;
+    border-radius: 8px;
+    background: #050d0a;
+  }
+
+  /* ---- ALERT BANNER ---- */
+  #alertBanner {
+    display: none;
+    padding: 12px 20px;
+    border-radius: var(--radius);
+    background: var(--red);
+    color: white;
+    font-weight: 700;
+    font-size: 1rem;
+    margin-bottom: 16px;
+    text-align: center;
+    animation: alertPulse 0.8s infinite alternate;
+  }
+
+  /* ---- INFO BAR ---- */
+  .info-bar {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    font-size: 0.75rem; color: var(--muted);
+    margin-top: 16px; padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .info-bar span { display: flex; align-items: center; gap: 6px; }
+
+  /* ---- HISTORY TABLE ---- */
+  .history-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    margin-top: 16px;
+    box-shadow: var(--shadow);
+    overflow-x: auto;
+  }
+  .history-card h2 {
+    font-size: 0.8rem; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: 12px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  th {
+    text-align: left; padding: 6px 10px;
+    color: var(--muted); border-bottom: 1px solid var(--border);
+    font-weight: 500;
+  }
+  td { padding: 6px 10px; border-bottom: 1px solid #0d1926; }
+  tr:last-child td { border-bottom: none; }
+  .td-crit { color: var(--red); font-weight: 700; }
+
+  footer {
+    margin-top: 24px; text-align: center;
+    font-size: 0.72rem; color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 36 36" fill="none">
+      <rect width="36" height="36" rx="8" fill="#111827"/>
+      <polyline points="2,18 8,18 11,8 14,28 17,14 20,22 23,18 36,18"
+        stroke="#00ff88" stroke-width="2.5" fill="none" stroke-linejoin="round"/>
+    </svg>
+    <div>
+      <h1>Patient Monitor</h1>
+      <p>Conrad Robotics — Made in Nigeria</p>
+    </div>
+  </div>
+  <div class="status-pill">
+    <div class="dot" id="liveDot"></div>
+    <span id="liveLabel">Connecting…</span>
+  </div>
+</header>
+
+<!-- Alert banner -->
+<div id="alertBanner">⚠ CRITICAL ALERT — <span id="alertMsg"></span></div>
+
+<!-- Vitals grid -->
+<div class="grid">
+  <!-- HR -->
+  <div class="card" id="hrCard">
+    <div class="card-icon">❤️</div>
+    <div class="card-label">Heart Rate</div>
+    <div class="card-value hr-val"><span id="hrVal">---</span><span class="card-unit">bpm</span></div>
+    <div class="card-bar"><div class="card-bar-fill" id="hrBar" style="width:0%;background:#f87171"></div></div>
+  </div>
+
+  <!-- SpO2 -->
+  <div class="card" id="spo2Card">
+    <div class="card-icon">🫁</div>
+    <div class="card-label">SpO2</div>
+    <div class="card-value spo2-val"><span id="spo2Val">---</span><span class="card-unit">%</span></div>
+    <div class="card-bar"><div class="card-bar-fill" id="spo2Bar" style="width:0%;background:#60a5fa"></div></div>
+  </div>
+
+  <!-- Temp -->
+  <div class="card" id="tempCard">
+    <div class="card-icon">🌡️</div>
+    <div class="card-label">Temperature</div>
+    <div class="card-value temp-val"><span id="tempVal">---</span><span class="card-unit">°C</span></div>
+    <div class="card-bar"><div class="card-bar-fill" id="tempBar" style="width:0%;background:#fb923c"></div></div>
+  </div>
+
+  <!-- ECG -->
+  <div class="ecg-card">
+    <div class="card-label">ECG Trace — Real-time</div>
+    <canvas id="ecgCanvas" width="900" height="150"></canvas>
+  </div>
+</div>
+
+<!-- Alert / info bar -->
+<div class="info-bar">
+  <span>🕐 Last update: <b id="lastUpdate">--</b></span>
+  <span>🏥 Patient ID: <b id="patientIdDisplay">--</b></span>
+  <span>📡 Broker: broker.hivemq.com</span>
+  <span>📁 Topic: conradrobotics/patient/1/vitals</span>
+</div>
+
+<!-- History table -->
+<div class="history-card">
+  <h2>Recent Readings (last 20)</h2>
+  <table>
+    <thead>
+      <tr><th>Time</th><th>HR (bpm)</th><th>SpO2 (%)</th><th>Temp (°C)</th><th>Status</th></tr>
+    </thead>
+    <tbody id="historyBody"></tbody>
+  </table>
+</div>
+
+<footer>
+  Conrad Robotics Patient Monitoring System · Federal University of Technology Owerri<br>
+  MQTT over WebSocket · ESP-NOW · FreeRTOS · GitHub Pages
+</footer>
+
+<!-- MQTT over WebSocket -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.0.5/mqtt.min.js"></script>
+<script>
+// ============================================================
+//  CONFIGURATION
+// ============================================================
+const MQTT_BROKER   = 'wss://broker.hivemq.com:8884/mqtt';
+const MQTT_TOPIC    = 'conradrobotics/patient/+/vitals';
+const PATIENT_ID    = 1;
+const STALE_TIMEOUT = 5000;  // ms before marking connection lost
+
+// ============================================================
+//  ECG CANVAS
+// ============================================================
+const canvas  = document.getElementById('ecgCanvas');
+const ctx     = canvas.getContext('2d');
+const W       = canvas.width;
+const H       = canvas.height;
+
+let ecgData   = new Array(W).fill(H / 2);  // Flat line
+let ecgHead   = 0;
+let lastEcgY  = H / 2;
+
+function drawECGFrame() {
+  // Background
+  ctx.fillStyle = '#050d0a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(0,255,136,0.06)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 60) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let y = 0; y < H; y += 30) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  // Baseline
+  ctx.strokeStyle = 'rgba(0,255,136,0.15)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, H/2); ctx.lineTo(W, H/2); ctx.stroke();
+
+  // Erase cursor block
+  const eraseW = 12;
+  ctx.fillStyle = '#050d0a';
+  ctx.fillRect(ecgHead + 1, 0, eraseW, H);
+
+  // ECG trace
+  ctx.beginPath();
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = '#00ff88';
+  ctx.shadowBlur = 6;
+  ctx.moveTo(0, ecgData[0]);
+  for (let i = 1; i < W; i++) {
+    let x = (ecgHead + i) % W;
+    ctx.lineTo(i, ecgData[x]);
+  }
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  requestAnimationFrame(drawECGFrame);
+}
+drawECGFrame();
+
+function pushECGValue(raw4095) {
+  // Map 0–4095 ADC to canvas Y (inverted)
+  const newY = H - Math.round((raw4095 / 4095) * (H - 10)) - 5;
+  ecgData[ecgHead] = newY;
+  ecgHead = (ecgHead + 1) % W;
+}
+
+// ============================================================
+//  UI UPDATES
+// ============================================================
+const ALERT_MSGS = ['', 'HR TOO LOW', 'HR TOO HIGH', 'SpO2 CRITICALLY LOW', 'HYPOTHERMIA', 'FEVER'];
+
+let lastRxTime = 0;
+
+function updateUI(data) {
+  lastRxTime = Date.now();
+
+  // HR
+  const hrEl = document.getElementById('hrVal');
+  hrEl.textContent = data.heart_rate > 0 ? data.heart_rate : '---';
+  document.getElementById('hrBar').style.width = Math.min(data.heart_rate / 200 * 100, 100) + '%';
+
+  // SpO2
+  document.getElementById('spo2Val').textContent = data.spo2 > 0 ? data.spo2 : '---';
+  const spo2Pct = Math.max(0, Math.min((data.spo2 - 80) / 20 * 100, 100));
+  document.getElementById('spo2Bar').style.width = spo2Pct + '%';
+
+  // Temp
+  document.getElementById('tempVal').textContent =
+    data.temperature > 10 ? parseFloat(data.temperature).toFixed(1) : '---';
+  const tempPct = Math.max(0, Math.min((data.temperature - 34) / 8 * 100, 100));
+  document.getElementById('tempBar').style.width = tempPct + '%';
+
+  // Patient ID
+  document.getElementById('patientIdDisplay').textContent = data.patient_id || PATIENT_ID;
+
+  // Timestamp
+  const now = new Date();
+  document.getElementById('lastUpdate').textContent =
+    now.toLocaleTimeString('en-GB', { hour12: false });
+
+  // Critical alert
+  const banner = document.getElementById('alertBanner');
+  const alertMsg = document.getElementById('alertMsg');
+  const hrCard   = document.getElementById('hrCard');
+  const spo2Card = document.getElementById('spo2Card');
+  const tempCard = document.getElementById('tempCard');
+
+  [hrCard, spo2Card, tempCard].forEach(c => c.classList.remove('alert'));
+
+  if (data.is_critical && data.alert_type > 0) {
+    banner.style.display = 'block';
+    alertMsg.textContent = ALERT_MSGS[data.alert_type] || 'CHECK PATIENT';
+    if (data.alert_type <= 2) hrCard.classList.add('alert');
+    else if (data.alert_type === 3) spo2Card.classList.add('alert');
+    else tempCard.classList.add('alert');
+  } else {
+    banner.style.display = 'none';
+  }
+
+  // History table
+  const tbody = document.getElementById('historyBody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td>${now.toLocaleTimeString()}</td>
+    <td>${data.heart_rate || '---'}</td>
+    <td>${data.spo2 || '---'}</td>
+    <td>${data.temperature > 10 ? parseFloat(data.temperature).toFixed(1) : '---'}</td>
+    <td class="${data.is_critical ? 'td-crit' : ''}">${data.is_critical ? '⚠ ' + (ALERT_MSGS[data.alert_type] || 'CRITICAL') : '✅ Stable'}</td>
+  `;
+  tbody.insertBefore(tr, tbody.firstChild);
+  // Keep only last 20 rows
+  while (tbody.rows.length > 20) tbody.deleteRow(tbody.rows.length - 1);
+}
+
+// ============================================================
+//  CONNECTION STATUS MONITOR
+// ============================================================
+function checkConnection() {
+  const dot   = document.getElementById('liveDot');
+  const label = document.getElementById('liveLabel');
+  const alive = lastRxTime > 0 && (Date.now() - lastRxTime) < STALE_TIMEOUT;
+
+  dot.className = 'dot ' + (alive ? 'live' : 'lost');
+  label.textContent = alive ? 'LIVE' : (lastRxTime === 0 ? 'Connecting…' : 'Signal lost');
+}
+setInterval(checkConnection, 1000);
+
+// ============================================================
+//  MQTT CONNECTION
+// ============================================================
+const client = mqtt.connect(MQTT_BROKER, {
+  clientId:  'web_' + Math.random().toString(16).slice(2, 8),
+  clean:     true,
+  reconnectPeriod: 3000,
+});
+
+client.on('connect', () => {
+  console.log('[MQTT] Connected');
+  client.subscribe(MQTT_TOPIC, err => {
+    if (err) console.error('[MQTT] Subscribe error:', err);
+    else console.log('[MQTT] Subscribed to', MQTT_TOPIC);
+  });
+});
+
+client.on('message', (topic, message) => {
+  try {
+    const data = JSON.parse(message.toString());
+    updateUI(data);
+
+    // Push ECG value if present (sent separately or embedded)
+    if (typeof data.ecg_value !== 'undefined') {
+      pushECGValue(data.ecg_value);
+    }
+  } catch (e) {
+    console.warn('[MQTT] Bad JSON:', message.toString());
+  }
+});
+
+client.on('error', err => console.error('[MQTT] Error:', err));
+client.on('reconnect', () => {
+  const dot = document.getElementById('liveDot');
+  dot.className = 'dot';
+});
+
+// ============================================================
+//  DEMO MODE — simulate data when no broker data arrives
+// ============================================================
+let demoMode = false;
+setTimeout(() => {
+  if (lastRxTime === 0) {
+    demoMode = true;
+    console.log('[DEMO] No broker data — running simulation');
+    runDemo();
+  }
+}, 6000);
+
+function runDemo() {
+  if (!demoMode) return;
+  let t = 0;
+  setInterval(() => {
+    t += 0.1;
+    const hr    = Math.round(72 + 5 * Math.sin(t * 0.3));
+    const spo2  = Math.round(98 + Math.sin(t * 0.7));
+    const temp  = parseFloat((36.5 + 0.2 * Math.sin(t * 0.1)).toFixed(1));
+    const ecg   = Math.round(2048 + 1500 * Math.sin(t * 3) * Math.exp(-((t % 2.09) * 0.5)));
+    updateUI({ patient_id:1, heart_rate:hr, spo2:spo2, temperature:temp,
+               is_critical:false, alert_type:0 });
+    pushECGValue(ecg);
+  }, 10);
+}
+</script>
+</body>
+</html>
