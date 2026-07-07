@@ -1,32 +1,7 @@
 /**
  * ============================================================
- *  PATIENT MONITORING SYSTEM — BEDSIDE UNIT
- *  Device: ESP32 (Standard 30-pin or 38-pin)
- *  Author: Conrad Robotics
- * ============================================================
- *  ARCHITECTURE:
- *   Core 0 → Sensor polling, ECG sampling, OLED UI,
- *             Rotary Encoder, ESP-NOW transmission, SD logging
- *   Core 1 → Wi-Fi management, MQTT publishing (GitHub Pages dashboard)
- *
- *  SENSORS:
- *   - MAX30102  : Heart Rate (BPM) + SpO2 via I2C (GPIO 21/22)
- *   - DS18B20   : Body Temperature via 1-Wire (GPIO 4)
- *   - AD8232    : ECG analog signal (GPIO 34, 14, 32)
- *   - DS3231    : Real-Time Clock via I2C (GPIO 21/22)
- *   - SD Card   : SPI data logger (GPIO 5, 18, 19, 23)
- *   - OLED      : SSD1306 128x64 via I2C (GPIO 21/22)
- *   - KY-040    : Rotary Encoder (GPIO 25, 26, 27)
- *
- *  REQUIRED LIBRARIES (Arduino Library Manager):
- *   - Adafruit SSD1306
- *   - Adafruit GFX Library
- *   - RTClib (by Adafruit)
- *   - SparkFun MAX3010x Pulse and Proximity Sensor Library
- *   - DallasTemperature
- *   - OneWire
- *   - PubSubClient (by Nick O'Leary)
- *   - ArduinoJson (by Benoit Blanchon)
+ * PATIENT MONITORING SYSTEM — BEDSIDE UNIT (FINAL SENDER)
+ * Features: ESP-NOW + Medical Sensors + Polling UI
  * ============================================================
  */
 
@@ -35,677 +10,367 @@
 #include <SD.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <esp_now.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
-
-// Sensor libraries
 #include "RTClib.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include "MAX30105.h"
 #include "heartRate.h"
 #include "spo2_algorithm.h"
-#include <OneWire.h>
-#include <DallasTemperature.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
 
-// ============================================================
-//  CONFIGURATION — EDIT THESE
-// ============================================================
-#define PATIENT_ID        1          // Unique bed/patient number
-#define WIFI_SSID         "Jesus is Lord"
-#define WIFI_PASSWORD     "ROBOTICS"
-#define MQTT_BROKER       "broker.hivemq.com"  // Free public broker
-#define MQTT_PORT         1883
-#define MQTT_TOPIC_BASE   "conradrobotics/patient/"
+#define ESPNOW_CHANNEL 1
 
-// CYD MAC address — replace with actual MAC from CYD's setup serial output
+// REPLACE WITH YOUR CYD'S MAC ADDRESS
 uint8_t CYD_MAC_ADDRESS[] = {0x94, 0x51, 0xDC, 0x32, 0xA7, 0x30};
 
-// Critical alert thresholds
-#define HR_MIN            50      // bpm — below this is bradycardia alert
-#define HR_MAX            120     // bpm — above this is tachycardia alert
-#define SPO2_MIN          90      // % — below this is hypoxia alert
-#define TEMP_MIN          35.0f   // °C — below this is hypothermia alert
-#define TEMP_MAX          38.5f   // °C — above this is fever alert
+// --- Hardware Pins ---
+#define SD_CS        5
+#define ONE_WIRE_BUS 4
+#define ECG_OUTPUT   34
+#define ECG_LO_PLUS  14
+#define ECG_LO_MINUS 32
+#define ROTARY_CLK   25
+#define ROTARY_DT    26
+#define ROTARY_SW    27
+#define I2C_SDA      21
+#define I2C_SCL      22
 
-// ============================================================
-//  PIN DEFINITIONS
-// ============================================================
-#define SD_CS             5
-#define ONE_WIRE_BUS      4
-#define ECG_OUTPUT        34
-#define ECG_LO_PLUS       14
-#define ECG_LO_MINUS      32
-#define ROTARY_CLK        25
-#define ROTARY_DT         26
-#define ROTARY_SW         27
-#define I2C_SDA           21
-#define I2C_SCL           22
+// --- Data Structures ---
+enum UIState { STATE_HOME, STATE_MENU, STATE_MEASURE };
+enum ParamType { PARAM_NONE = 0, PARAM_BPM, PARAM_SPO2, PARAM_BOTH, PARAM_TEMP, PARAM_ECG };
 
-// ============================================================
-//  SHARED DATA STRUCTURE (must be identical on both devices)
-// ============================================================
-typedef struct PatientPayload {
-    uint8_t  patient_id;       // Bed / patient number
-    float    temperature;      // DS18B20 body temp in °C
-    int16_t  heart_rate;       // BPM from MAX30102
-    int16_t  spo2;             // SpO2 % from MAX30102
-    int16_t  ecg_value;        // Raw ADC value 0–4095
-    bool     ecg_leads_off;    // True if AD8232 leads are disconnected
-    uint8_t  active_param;     // Selected parameter: 0=ECG,1=HR,2=SpO2,3=Temp,4=All
-    bool     is_critical;      // True if any value exceeds threshold
-    uint8_t  alert_type;       // 0=None 1=HR_low 2=HR_high 3=SpO2 4=Temp_low 5=Temp_high
-    uint32_t timestamp;        // Unix epoch from RTC
+// THE MEDICAL PAYLOAD (Must match CYD exactly)
+typedef struct __attribute__((packed)) PatientPayload {
+    uint8_t  patient_id;
+    float    temperature;
+    int16_t  heart_rate;
+    int16_t  spo2;
+    int16_t  ecg_value;
+    bool     ecg_leads_off;
+    uint8_t  active_param; 
 } PatientPayload;
 
 PatientPayload patientData;
-
-// ============================================================
-//  OBJECT DECLARATIONS
-// ============================================================
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
-RTC_DS3231       rtc;
-MAX30105         particleSensor;
-OneWire          oneWire(ONE_WIRE_BUS);
+RTC_DS3231 rtc;
+OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
-WiFiClient       espClient;
-PubSubClient     mqttClient(espClient);
+MAX30105 particleSensor;
+
+// --- State Variables ---
+volatile int menuIndex = 0;
+volatile bool btnPressed = false;
+volatile bool uiNeedsUpdate = true;
+
+UIState currentState = STATE_HOME;
+ParamType selectedParam = PARAM_NONE;
+const int MENU_ITEMS = 7;
+const char* menuStrings[] = {"Read BPM", "Read SpO2", "Read Both", "Read Temp", "Read ECG", "Reset Patient", "<- Home"};
+
+// --- Sensor Buffers & Filters ---
+uint32_t irBuffer[100]; 
+uint32_t redBuffer[100];
+int32_t spo2Value, heartRateValue;
+int8_t validSPO2, validHeartRate;
+
+float smoothedBPM = 0;  
+float smoothedSpO2 = 0;
+
+unsigned long lastTempRequest = 0;
+bool tempRequested = false;
+
+// --- Timers ---
+unsigned long lastSDLogMillis = 0;
+unsigned long lastClockUpdate = 0; 
+unsigned long lastTxMillis = 0;
+unsigned long lastEcgTxMillis = 0;
+const unsigned long SD_LOG_INTERVAL_MS = 5000; 
+const unsigned long TX_INTERVAL_MS = 10000; 
+
+// ==========================================
+// INTERRUPTS 
+// ==========================================
+const int8_t enc_states[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 
-// ============================================================
-//  FREERTOS HANDLES & SYNCHRONISATION
-// ============================================================
-TaskHandle_t TaskCore0;
-TaskHandle_t TaskCore1;
-SemaphoreHandle_t dataMutex;   // Protects patientData between cores
-
-// ============================================================
-//  MAX30102 — Beat detection buffers
-// ============================================================
-#define MAX30102_BUFFER_LEN 100
-uint32_t irBuffer[MAX30102_BUFFER_LEN];
-uint32_t redBuffer[MAX30102_BUFFER_LEN];
-int32_t  spo2Value;
-int8_t   validSPO2;
-int32_t  heartRateValue;
-int8_t   validHeartRate;
-
-// ============================================================
-//  ROTARY ENCODER — State machine
-// ============================================================
-volatile int  encoderCount  = 0;
-volatile bool btnPressed    = false;
-int           menuIndex     = 0;      // 0–4 matching active_param
-int           lastMenuIndex = -1;
-unsigned long lastBtnTime   = 0;
-
-const char* menuItems[] = {
-    "ECG Graph",
-    "Heart Rate",
-    "SpO2",
-    "Temperature",
-    "All Vitals"
-};
-#define MENU_COUNT 5
-
-// ============================================================
-//  SD CARD — Logging
-// ============================================================
-unsigned long lastSDLog   = 0;
-#define SD_LOG_INTERVAL_MS 1000
-
-// ============================================================
-//  OLED — Screen states
-// ============================================================
-unsigned long lastOledUpdate = 0;
-#define OLED_UPDATE_INTERVAL_MS 200
-
-// ============================================================
-//  FORWARD DECLARATIONS
-// ============================================================
-void core0Task(void* pvParameters);
-void core1Task(void* pvParameters);
-void IRAM_ATTR encoderISR();
-void IRAM_ATTR btnISR();
-void onESPNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status);
-void readMAX30102();
-void readDS18B20();
-void readECG();
-void evaluateCritical();
-void updateOLED();
-void logToSD(DateTime now);
-void drawMenuOLED();
-void connectMQTT();
-void publishMQTT();
-String buildMQTTJson();
-
-// ============================================================
-//  SETUP
-// ============================================================
-void setup() {
-    Serial.begin(115200);
-    Serial.println(F("\n=== BEDSIDE UNIT — Conrad Robotics ==="));
-
-    Wire.begin(I2C_SDA, I2C_SCL);
-
-    // ---- OLED ----
-    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        Serial.println(F("[OLED] FAIL"));
-    } else {
-        splashScreen();
-    }
-
-    // ---- RTC ----
-    if (!rtc.begin()) {
-        Serial.println(F("[RTC] FAIL — check wiring"));
-    } else {
-        if (rtc.lostPower()) {
-            rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-            Serial.println(F("[RTC] Power lost — time reset to compile time"));
-        }
-        Serial.println(F("[RTC] OK"));
-    }
-
-    // ---- MAX30102 ----
-    if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-        Serial.println(F("[MAX30102] FAIL — check wiring"));
-    } else {
-        particleSensor.setup(60, 4, 2, 100, 411, 4096);
-        // ledBrightness=60, sampleAverage=4, ledMode=2(Red+IR),
-        // sampleRate=100, pulseWidth=411, adcRange=4096
-        Serial.println(F("[MAX30102] OK"));
-    }
-
-    // ---- DS18B20 ----
-    ds18b20.begin();
-    Serial.printf("[DS18B20] Found %d sensor(s)\n", ds18b20.getDeviceCount());
-
-    // ---- SD Card ----
-    if (!SD.begin(SD_CS)) {
-        Serial.println(F("[SD] FAIL — check card/wiring"));
-    } else {
-        Serial.printf("[SD] OK — %llu MB\n", SD.cardSize() / (1024 * 1024));
-    }
-
-    // ---- Rotary Encoder ----
-    pinMode(ROTARY_CLK, INPUT);
-    pinMode(ROTARY_DT,  INPUT);
-    pinMode(ROTARY_SW,  INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ROTARY_CLK), encoderISR, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ROTARY_SW),  btnISR,     FALLING);
-    Serial.println(F("[ENCODER] OK"));
-
-    // ---- ECG ----
-    pinMode(ECG_LO_PLUS,  INPUT);
-    pinMode(ECG_LO_MINUS, INPUT);
-    Serial.println(F("[ECG] OK"));
-
-    // ---- Initial data defaults ----
-    patientData.patient_id    = PATIENT_ID;
-    patientData.active_param  = 0;   // Start on ECG
-    patientData.is_critical   = false;
-    patientData.alert_type    = 0;
-    patientData.temperature   = 0.0f;
-    patientData.heart_rate    = 0;
-    patientData.spo2          = 0;
-    patientData.ecg_value     = 0;
-    patientData.ecg_leads_off = true;
-
-    // ---- FreeRTOS mutex ----
-    dataMutex = xSemaphoreCreateMutex();
-
-    // ---- FreeRTOS tasks ----
-    xTaskCreatePinnedToCore(core0Task, "Core0_Local", 16000, NULL, 2, &TaskCore0, 0);
-    xTaskCreatePinnedToCore(core1Task, "Core1_Cloud", 16000, NULL, 1, &TaskCore1, 1);
-
-    Serial.println(F("[BOOT] Complete — FreeRTOS running\n"));
-    vTaskDelete(NULL);  // Delete the Arduino loop task
-}
-
-void loop() {}  // Never reached — FreeRTOS takes over
-
-// ============================================================
-//  CORE 0 — Sensors, ESP-NOW, OLED, SD Card
-// ============================================================
-void core0Task(void* pvParameters) {
-    // ESP-NOW init on Core 0
-    WiFi.mode(WIFI_STA);
-    if (esp_now_init() != ESP_OK) {
-        Serial.println(F("[ESP-NOW] Init FAIL"));
-    } else {
-        esp_now_register_send_cb(onESPNowSent);
-
-        esp_now_peer_info_t peerInfo = {};
-        memcpy(peerInfo.peer_addr, CYD_MAC_ADDRESS, 6);
-        peerInfo.channel = 0;
-        peerInfo.encrypt = false;
-        if (esp_now_add_peer(&peerInfo) == ESP_OK) {
-            Serial.println(F("[ESP-NOW] Peer registered OK"));
-        }
-    }
-
-    // Prime the MAX30102 buffer
-    for (int i = 0; i < MAX30102_BUFFER_LEN; i++) {
-        while (!particleSensor.available()) {
-            particleSensor.check();
-        }
-        redBuffer[i] = particleSensor.getRed();
-        irBuffer[i]  = particleSensor.getIR();
-        particleSensor.nextSample();
-    }
-    maxim_heart_rate_and_oxygen_saturation(
-        irBuffer, MAX30102_BUFFER_LEN, redBuffer,
-        &spo2Value, &validSPO2,
-        &heartRateValue, &validHeartRate);
-
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xPeriod = pdMS_TO_TICKS(10);  // 100 Hz
-
-    for (;;) {
-        // --- Handle encoder menu ---
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-            patientData.active_param = (uint8_t)menuIndex;
-            xSemaphoreGive(dataMutex);
-        }
-
-        // --- ECG (every tick — 100 Hz) ---
-        readECG();
-
-        // --- Slower sensors (every 25 ticks — ~4 Hz) ---
-        static uint8_t slowTick = 0;
-        if (++slowTick >= 25) {
-            slowTick = 0;
-            readMAX30102();
-            readDS18B20();
-            evaluateCritical();
-        }
-
-        // --- OLED update ---
-        if (millis() - lastOledUpdate >= OLED_UPDATE_INTERVAL_MS) {
-            lastOledUpdate = millis();
-            if (btnPressed) {
-                drawMenuOLED();
-            } else {
-                updateOLED();
-            }
-        }
-
-        // --- ESP-NOW send ---
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-            esp_now_send(CYD_MAC_ADDRESS, (uint8_t*)&patientData, sizeof(patientData));
-            xSemaphoreGive(dataMutex);
-        }
-
-        // --- SD Card log ---
-        if (millis() - lastSDLog >= SD_LOG_INTERVAL_MS) {
-            lastSDLog = millis();
-            DateTime now = rtc.now();
-            logToSD(now);
-        }
-
-        vTaskDelayUntil(&xLastWakeTime, xPeriod);
-    }
-}
-
-// ============================================================
-//  CORE 1 — Wi-Fi + MQTT
-// ============================================================
-void core1Task(void* pvParameters) {
-    vTaskDelay(pdMS_TO_TICKS(3000));  // Let Core 0 bring up ESP-NOW first
-
-    // Wi-Fi connect
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print(F("[WiFi] Connecting"));
-    uint8_t attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        Serial.print(".");
-        attempts++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[WiFi] Connected — IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println(F("\n[WiFi] FAILED — running offline"));
-    }
-
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-    mqttClient.setBufferSize(512);
-
-    for (;;) {
-        if (WiFi.status() == WL_CONNECTED) {
-            if (!mqttClient.connected()) {
-                connectMQTT();
-            }
-            mqttClient.loop();
-            publishMQTT();
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));  // Publish every second
-    }
-}
-
-// ============================================================
-//  SENSOR READS
-// ============================================================
-void readECG() {
-    bool lo_plus  = digitalRead(ECG_LO_PLUS);
-    bool lo_minus = digitalRead(ECG_LO_MINUS);
-
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-        patientData.ecg_leads_off = (lo_plus || lo_minus);
-        if (!patientData.ecg_leads_off) {
-            patientData.ecg_value = (int16_t)analogRead(ECG_OUTPUT);
-        }
-        xSemaphoreGive(dataMutex);
-    }
-}
-
-void readMAX30102() {
-    // Shift buffer left by 25 samples and read 25 new ones
-    for (int i = 25; i < MAX30102_BUFFER_LEN; i++) {
-        redBuffer[i - 25] = redBuffer[i];
-        irBuffer[i - 25]  = irBuffer[i];
-    }
-    for (int i = (MAX30102_BUFFER_LEN - 25); i < MAX30102_BUFFER_LEN; i++) {
-        while (!particleSensor.available()) {
-            particleSensor.check();
-        }
-        redBuffer[i] = particleSensor.getRed();
-        irBuffer[i]  = particleSensor.getIR();
-        particleSensor.nextSample();
-    }
-    maxim_heart_rate_and_oxygen_saturation(
-        irBuffer, MAX30102_BUFFER_LEN, redBuffer,
-        &spo2Value, &validSPO2,
-        &heartRateValue, &validHeartRate);
-
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (validHeartRate && heartRateValue > 20 && heartRateValue < 250) {
-            patientData.heart_rate = (int16_t)heartRateValue;
-        }
-        if (validSPO2 && spo2Value > 50) {
-            patientData.spo2 = (int16_t)spo2Value;
-        }
-        xSemaphoreGive(dataMutex);
-    }
-}
-
-void readDS18B20() {
-    ds18b20.requestTemperatures();
-    float t = ds18b20.getTempCByIndex(0);
-
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (t != DEVICE_DISCONNECTED_C) {
-            patientData.temperature = t;
-        }
-        xSemaphoreGive(dataMutex);
-    }
-}
-
-void evaluateCritical() {
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        patientData.is_critical = false;
-        patientData.alert_type  = 0;
-
-        if (patientData.heart_rate > 0 && patientData.heart_rate < HR_MIN) {
-            patientData.is_critical = true;
-            patientData.alert_type  = 1;
-        } else if (patientData.heart_rate > HR_MAX) {
-            patientData.is_critical = true;
-            patientData.alert_type  = 2;
-        } else if (patientData.spo2 > 0 && patientData.spo2 < SPO2_MIN) {
-            patientData.is_critical = true;
-            patientData.alert_type  = 3;
-        } else if (patientData.temperature > 10.0f && patientData.temperature < TEMP_MIN) {
-            patientData.is_critical = true;
-            patientData.alert_type  = 4;
-        } else if (patientData.temperature > TEMP_MAX) {
-            patientData.is_critical = true;
-            patientData.alert_type  = 5;
-        }
-
-        xSemaphoreGive(dataMutex);
-    }
-}
-
-// ============================================================
-//  OLED UI
-// ============================================================
-void splashScreen() {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
-    display.setCursor(10, 8);
-    display.setTextSize(1);
-    display.println(F("PATIENT MONITOR"));
-    display.drawLine(0, 18, 128, 18, SSD1306_WHITE);
-    display.setCursor(20, 25);
-    display.setTextSize(1);
-    display.println(F("Conrad Robotics"));
-    display.setCursor(15, 38);
-    display.println(F("Made in Nigeria"));
-    display.setCursor(28, 52);
-    display.println(F("Booting..."));
-    display.display();
-    delay(2500);
-}
-
-void updateOLED() {
-    display.clearDisplay();
-
-    // Header bar
-    display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setTextSize(1);
-    display.setCursor(2, 2);
-    display.printf("BED %02d", PATIENT_ID);
-
-    DateTime now = rtc.now();
-    display.setCursor(60, 2);
-    display.printf("%02d:%02d:%02d", now.hour(), now.minute(), now.second());
-
-    display.setTextColor(SSD1306_WHITE);
-
-    uint8_t param;
-    float   temp;
-    int16_t hr, sp;
-    bool    crit;
-    uint8_t alertT;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-        param  = patientData.active_param;
-        temp   = patientData.temperature;
-        hr     = patientData.heart_rate;
-        sp     = patientData.spo2;
-        crit   = patientData.is_critical;
-        alertT = patientData.alert_type;
-        xSemaphoreGive(dataMutex);
-    }
-
-    // Critical alert banner
-    if (crit) {
-        display.fillRect(0, 56, 128, 8, SSD1306_WHITE);
-        display.setTextColor(SSD1306_BLACK);
-        display.setCursor(2, 57);
-        const char* alerts[] = {"", "HR LOW!", "HR HIGH!", "SpO2 LOW!", "HYPOTHERMIA!", "FEVER!"};
-        display.print(alerts[alertT]);
-        display.setTextColor(SSD1306_WHITE);
-    }
-
-    // Vitals
-    display.setTextSize(1);
-    display.setCursor(0, 15);
-    display.printf("HR:   %3d bpm", hr);
-    display.setCursor(0, 25);
-    display.printf("SpO2: %3d %%", sp);
-    display.setCursor(0, 35);
-    display.printf("Temp: %.1f C", temp);
-
-    // Active parameter indicator
-    display.setCursor(80, 15);
-    display.print(F("Param:"));
-    display.setCursor(80, 25);
-    const char* shortLabels[] = {"ECG", "HR", "SpO2", "Temp", "All"};
-    display.print(shortLabels[param]);
-
-    display.display();
-}
-
-void drawMenuOLED() {
-    display.clearDisplay();
-
-    display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setTextSize(1);
-    display.setCursor(20, 2);
-    display.print(F("SELECT PARAM"));
-    display.setTextColor(SSD1306_WHITE);
-
-    for (int i = 0; i < MENU_COUNT; i++) {
-        int y = 14 + i * 10;
-        if (i == menuIndex) {
-            display.fillRect(0, y, 128, 10, SSD1306_WHITE);
-            display.setTextColor(SSD1306_BLACK);
-        } else {
-            display.setTextColor(SSD1306_WHITE);
-        }
-        display.setCursor(4, y + 1);
-        display.print(menuItems[i]);
-    }
-    display.display();
-}
-
-// ============================================================
-//  SD CARD LOGGING
-// ============================================================
-void logToSD(DateTime now) {
-    char filename[16];
-    sprintf(filename, "/%04d%02d%02d.csv", now.year(), now.month(), now.day());
-
-    // Write CSV header if file is new
-    if (!SD.exists(filename)) {
-        File hdr = SD.open(filename, FILE_WRITE);
-        if (hdr) {
-            hdr.println(F("Time,PatientID,Temp_C,HR_bpm,SpO2_%,ECG_raw,Critical,AlertType"));
-            hdr.close();
-        }
-    }
-
-    float   temp;
-    int16_t hr, sp, ecg;
-    bool    crit;
-    uint8_t alertT;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        temp   = patientData.temperature;
-        hr     = patientData.heart_rate;
-        sp     = patientData.spo2;
-        ecg    = patientData.ecg_value;
-        crit   = patientData.is_critical;
-        alertT = patientData.alert_type;
-        xSemaphoreGive(dataMutex);
-    }
-
-    File dataFile = SD.open(filename, FILE_APPEND);
-    if (dataFile) {
-        dataFile.printf("%02d:%02d:%02d,%d,%.1f,%d,%d,%d,%d,%d\n",
-            now.hour(), now.minute(), now.second(),
-            PATIENT_ID, temp, hr, sp, ecg, (int)crit, alertT);
-        dataFile.close();
-    }
-}
-
-// ============================================================
-//  MQTT
-// ============================================================
-void connectMQTT() {
-    char clientId[20];
-    sprintf(clientId, "patient_%d_bedside", PATIENT_ID);
-
-    uint8_t retries = 0;
-    while (!mqttClient.connected() && retries < 5) {
-        Serial.print(F("[MQTT] Connecting..."));
-        if (mqttClient.connect(clientId)) {
-            Serial.println(F(" OK"));
-        } else {
-            Serial.printf(" FAIL rc=%d, retry in 2s\n", mqttClient.state());
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            retries++;
-        }
-    }
-}
-
-void publishMQTT() {
-    if (!mqttClient.connected()) return;
-
-    char topic[64];
-    sprintf(topic, "%s%d/vitals", MQTT_TOPIC_BASE, PATIENT_ID);
-
-    String payload = buildMQTTJson();
-    mqttClient.publish(topic, payload.c_str());
-}
-
-String buildMQTTJson() {
-    StaticJsonDocument<256> doc;
-
-    float   temp;
-    int16_t hr, sp;
-    bool    crit;
-    uint8_t alertT;
-    uint32_t ts;
-
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        temp   = patientData.temperature;
-        hr     = patientData.heart_rate;
-        sp     = patientData.spo2;
-        crit   = patientData.is_critical;
-        alertT = patientData.alert_type;
-        ts     = patientData.timestamp;
-        xSemaphoreGive(dataMutex);
-    }
-
-    DateTime now = rtc.now();
-
-    doc["patient_id"]  = PATIENT_ID;
-    doc["timestamp"]   = now.unixtime();
-    doc["temperature"] = serialized(String(temp, 1));
-    doc["heart_rate"]  = hr;
-    doc["spo2"]        = sp;
-    doc["is_critical"] = crit;
-    doc["alert_type"]  = alertT;
-
-    String output;
-    serializeJson(doc, output);
-    return output;
-}
-
-// ============================================================
-//  INTERRUPTS
-// ============================================================
 void IRAM_ATTR encoderISR() {
-    static int lastCLK = LOW;
-    int clk = digitalRead(ROTARY_CLK);
-    if (clk != lastCLK && clk == HIGH) {
-        if (digitalRead(ROTARY_DT) != clk) {
-            menuIndex = (menuIndex + 1) % MENU_COUNT;   // CW → next
-        } else {
-            menuIndex = (menuIndex - 1 + MENU_COUNT) % MENU_COUNT;  // CCW → prev
-        }
+    static uint8_t old_AB = 3; 
+    static int enc_val = 0;
+    
+    old_AB <<= 2;
+    old_AB |= ((digitalRead(ROTARY_CLK) << 1) | digitalRead(ROTARY_DT));
+    enc_val += enc_states[(old_AB & 0x0f)];
+    
+    portENTER_CRITICAL_ISR(&mux);
+    if (enc_val > 3) {
+        if (currentState == STATE_MENU) { menuIndex = (menuIndex + 1) % MENU_ITEMS; }
+        enc_val = 0; uiNeedsUpdate = true;
+    } else if (enc_val < -3) {
+        if (currentState == STATE_MENU) { menuIndex = (menuIndex - 1 + MENU_ITEMS) % MENU_ITEMS; }
+        enc_val = 0; uiNeedsUpdate = true;
     }
-    lastCLK = clk;
+    portEXIT_CRITICAL_ISR(&mux);
 }
 
 void IRAM_ATTR btnISR() {
+    static unsigned long lastBtnTime = 0;
     unsigned long now = millis();
-    if (now - lastBtnTime > 200) {   // 200 ms debounce
-        btnPressed = !btnPressed;
+    if (now - lastBtnTime > 250) { 
+        if (digitalRead(ROTARY_SW) == LOW) { 
+            btnPressed = true; uiNeedsUpdate = true;
+        }
         lastBtnTime = now;
     }
 }
 
-// ============================================================
-//  ESP-NOW SEND CALLBACK
-// ============================================================
-void onESPNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status) {
-    // ESP32 Arduino Core 3.x: MAC is now in txInfo->ra (receiver address)
-    // Optional: track delivery failure count for reliability monitoring
-    // if (status != ESP_NOW_SEND_SUCCESS) { /* handle failure */ }
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+    Serial.begin(115200);
+
+    // 1. DISPLAY INIT
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000); 
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+    
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(15, 20);
+    display.print("BOOTING");
+    display.display();
+    
+    // 2. HARDWARE INIT
+    rtc.begin();
+    ds18b20.begin();
+    ds18b20.setWaitForConversion(false); 
+    SD.begin(SD_CS);
+
+    if (particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        particleSensor.setup(60, 4, 2, 100, 411, 4096); 
+    }
+
+    // 3. WIFI / ESP-NOW INIT (From Validated Test)
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); 
+    WiFi.disconnect(true, true); 
+    delay(200);
+    
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    if (esp_now_init() == ESP_OK) {
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, CYD_MAC_ADDRESS, 6);
+        peerInfo.channel = ESPNOW_CHANNEL; 
+        peerInfo.encrypt = false;
+        peerInfo.ifidx = WIFI_IF_STA;
+        esp_now_add_peer(&peerInfo);
+        Serial.println("ESP-NOW Ready");
+    }
+
+    // 4. PINS & INTERRUPTS
+    pinMode(ECG_LO_PLUS, INPUT);
+    pinMode(ECG_LO_MINUS, INPUT);
+    pinMode(ROTARY_CLK, INPUT_PULLUP);
+    pinMode(ROTARY_DT,  INPUT_PULLUP);
+    pinMode(ROTARY_SW,  INPUT_PULLUP);
+    
+    attachInterrupt(digitalPinToInterrupt(ROTARY_CLK), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ROTARY_DT),  encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ROTARY_SW),  btnISR, FALLING);
+
+    memset(&patientData, 0, sizeof(patientData));
+    patientData.patient_id = 1;
+    
+    delay(500); 
+    display.clearDisplay();
+    display.display();
+}
+
+// ==========================================
+// MAIN LOOP & CORE FUNCTIONS
+// ==========================================
+void loop() {
+    if (millis() - lastClockUpdate > 1000) {
+        uiNeedsUpdate = true;
+        lastClockUpdate = millis();
+    }
+    
+    handleUI();
+    readSensors();
+    handleTransmission();
+    
+    if (millis() - lastSDLogMillis > SD_LOG_INTERVAL_MS) {
+        lastSDLogMillis = millis();
+        logDataToSD();
+    }
+}
+
+void handleUI() {
+    if (btnPressed) {
+        portENTER_CRITICAL(&mux);
+        btnPressed = false;
+        portEXIT_CRITICAL(&mux);
+        
+        if (currentState == STATE_HOME) { currentState = STATE_MENU; menuIndex = 0; } 
+        else if (currentState == STATE_MENU) {
+            if (menuIndex == 5) { patientData.patient_id++; currentState = STATE_HOME; } 
+            else if (menuIndex == 6) { currentState = STATE_HOME; } 
+            else { 
+                selectedParam = (ParamType)(menuIndex + 1); 
+                currentState = STATE_MEASURE; 
+                if (selectedParam == PARAM_BPM || selectedParam == PARAM_SPO2 || selectedParam == PARAM_BOTH) {
+                    particleSensor.clearFIFO();
+                    smoothedBPM = 0;
+                    smoothedSpO2 = 0;
+                }
+            }
+        } 
+        else if (currentState == STATE_MEASURE) {
+            currentState = STATE_MENU; 
+            selectedParam = PARAM_NONE;
+            patientData.active_param = 0;
+            esp_now_send(CYD_MAC_ADDRESS, (uint8_t*)&patientData, sizeof(patientData));
+        }
+    }
+
+    if (!uiNeedsUpdate) return;
+    uiNeedsUpdate = false;
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    
+    // Status Bar
+    display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(2, 2); 
+    display.print("BED "); display.print(patientData.patient_id);
+    
+    DateTime now = rtc.now();
+    display.setCursor(95, 2);
+    display.printf("%02d:%02d", now.hour(), now.minute());
+    
+    display.setTextColor(SSD1306_WHITE);
+    int bodyY = 16;
+
+    if (currentState == STATE_HOME) {
+        display.setCursor(15, 25); display.print("Push knob to Menu");
+        display.setCursor(26, 45); display.print("Stay healthy!");
+    } 
+    else if (currentState == STATE_MENU) {
+        int startItem = (menuIndex >= 4) ? (menuIndex - 3) : 0;
+        for (int i = 0; i < 4; i++) {
+            int actualItem = startItem + i;
+            if (actualItem >= MENU_ITEMS) break;
+            int yPos = bodyY + (i * 12);
+            
+            if (actualItem == menuIndex) { 
+                display.fillRect(0, yPos - 1, 128, 11, SSD1306_WHITE); 
+                display.setTextColor(SSD1306_BLACK); display.setCursor(2, yPos); display.print(">");
+            } else {
+                display.setTextColor(SSD1306_WHITE); display.setCursor(8, yPos);
+            }
+            display.setCursor(12, yPos); display.print(menuStrings[actualItem]);
+        }
+    } 
+    else if (currentState == STATE_MEASURE) {
+        display.setTextSize(1); display.setCursor(0, bodyY); display.print("Measuring...");
+        display.setTextSize(2); 
+        
+        String bpmStr = (patientData.heart_rate == 0 || smoothedBPM == 0) ? "---" : String(patientData.heart_rate);
+        String spo2Str = (patientData.spo2 == 0 || smoothedSpO2 == 0) ? "---" : String(patientData.spo2);
+        
+        if (selectedParam == PARAM_BPM) { display.setCursor(10, bodyY + 16); display.print(bpmStr); display.print(" bpm"); }
+        else if (selectedParam == PARAM_SPO2) { display.setCursor(10, bodyY + 16); display.print(spo2Str); display.print(" %"); }
+        else if (selectedParam == PARAM_BOTH) {
+            display.setTextSize(1);
+            display.setCursor(10, bodyY + 12); display.print("BPM:  "); display.print(bpmStr);
+            display.setCursor(10, bodyY + 24); display.print("SpO2: "); display.print(spo2Str); display.print(" %");
+        }
+        else if (selectedParam == PARAM_TEMP) { display.setCursor(10, bodyY + 16); display.print(patientData.temperature, 1); display.print(" C"); }
+        else if (selectedParam == PARAM_ECG) { display.setTextSize(1); display.setCursor(10, bodyY + 16); display.print("ECG: "); display.print(patientData.ecg_value); }
+        
+        display.setTextSize(1); display.setCursor(0, bodyY + 40); display.print("<- Press to stop");
+        patientData.active_param = selectedParam;
+    }
+    display.display();
+}
+
+void readSensors() {
+    unsigned long currentMillis = millis();
+
+    if (currentState == STATE_MEASURE && (selectedParam == PARAM_BPM || selectedParam == PARAM_SPO2 || selectedParam == PARAM_BOTH)) {
+        static int sampleCounter = 0;
+        particleSensor.check(); 
+        while (particleSensor.available()) {
+            memmove(redBuffer, redBuffer + 1, 99 * sizeof(uint32_t));
+            memmove(irBuffer, irBuffer + 1, 99 * sizeof(uint32_t));
+            redBuffer[99] = particleSensor.getRed(); 
+            irBuffer[99] = particleSensor.getIR();
+            particleSensor.nextSample(); 
+            sampleCounter++;
+        }
+
+        if (sampleCounter >= 25) {
+            maxim_heart_rate_and_oxygen_saturation(irBuffer, 100, redBuffer, &spo2Value, &validSPO2, &heartRateValue, &validHeartRate);
+            if (validHeartRate && heartRateValue > 30 && heartRateValue < 220) {
+                smoothedBPM = (smoothedBPM == 0) ? heartRateValue : (smoothedBPM * 0.9) + (heartRateValue * 0.1);
+                patientData.heart_rate = (int16_t)smoothedBPM;
+            }
+            if (validSPO2 && spo2Value >= 50 && spo2Value <= 100) {
+                smoothedSpO2 = (smoothedSpO2 == 0) ? spo2Value : (smoothedSpO2 * 0.9) + (spo2Value * 0.1);
+                patientData.spo2 = (int16_t)smoothedSpO2;
+            }
+            sampleCounter = 0;
+            uiNeedsUpdate = true; 
+        }
+    }
+
+    if (selectedParam == PARAM_ECG) {
+        patientData.ecg_leads_off = (digitalRead(ECG_LO_PLUS) || digitalRead(ECG_LO_MINUS));
+        patientData.ecg_value = analogRead(ECG_OUTPUT);
+        uiNeedsUpdate = true; 
+    }
+
+    if (selectedParam == PARAM_TEMP) {
+        if (!tempRequested && currentMillis - lastTempRequest > 1000) {
+            ds18b20.requestTemperatures(); 
+            lastTempRequest = currentMillis; tempRequested = true;
+        } else if (tempRequested && currentMillis - lastTempRequest > 750) {
+            float t = ds18b20.getTempCByIndex(0);
+            if (t > 10.0 && t < 85.0) { patientData.temperature = t; uiNeedsUpdate = true; }
+            tempRequested = false;
+        }
+    }
+}
+
+void handleTransmission() {
+    if (currentState != STATE_MEASURE) return;
+    unsigned long currentMillis = millis();
+
+    if (selectedParam == PARAM_ECG) {
+        if (currentMillis - lastEcgTxMillis >= 20) { 
+            esp_now_send(CYD_MAC_ADDRESS, (uint8_t*)&patientData, sizeof(patientData));
+            lastEcgTxMillis = currentMillis;
+        }
+    } else {
+        if (currentMillis - lastTxMillis >= TX_INTERVAL_MS) { 
+            esp_now_send(CYD_MAC_ADDRESS, (uint8_t*)&patientData, sizeof(patientData));
+            lastTxMillis = currentMillis;
+        }
+    }
+}
+
+void logDataToSD() {
+    DateTime now = rtc.now();
+    File dataFile = SD.open("/log.csv", FILE_APPEND);
+    if (dataFile) {
+        dataFile.printf("%02d:%02d:%02d,Temp:%.1f,HR:%d,SpO2:%d,ECG:%d\n", 
+            now.hour(), now.minute(), now.second(), 
+            patientData.temperature, patientData.heart_rate, patientData.spo2, patientData.ecg_value);
+        dataFile.close();
+    }
 }
