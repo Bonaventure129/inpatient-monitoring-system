@@ -1,8 +1,8 @@
 /**
  * ============================================================
- * PATIENT MONITORING SYSTEM — BEDSIDE UNIT (NON-BLOCKING WIFI)
- * FIXED: Stale-vitals zeroing on mode switch + simplified ESP-NOW
- * peer channel handling so it coexists cleanly with Wi-Fi/MQTT.
+ * PATIENT MONITORING SYSTEM — BEDSIDE UNIT (MAIN STATION)
+ * FEATURES: Non-blocking WiFi, MQTT Web Commands, mDNS (conrad.local), 
+ * Async SD Card WebServer, exhaustive payload JSON, and SD Card Logging.
  * ============================================================
  */
 
@@ -21,14 +21,16 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <PubSubClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 
 // --- NETWORK CONFIG ---
 const char* WIFI_SSID = "Jesus is Lord";
 const char* WIFI_PASS = "ROBOTICS";
 const char* MQTT_BROKER = "broker.hivemq.com";
 const char* MQTT_TOPIC = "conradrobotics/patient/1/vitals";
+const char* MQTT_CMD_TOPIC = "conradrobotics/patient/1/cmd";
 
-// REPLACE WITH CYD MAC
 uint8_t CYD_MAC_ADDRESS[] = {0x94, 0x51, 0xDC, 0x32, 0xA7, 0x30};
 
 // --- Hardware Pins ---
@@ -67,10 +69,9 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 RTC_DS3231 rtc;
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
-MAX30105 particleSensor;
-
-WiFiClient espClient;
+MAX30105 particleSensor;j
 PubSubClient mqttClient(espClient);
+WebServer server(80);
 
 volatile int menuIndex = 0;
 volatile bool btnPressed = false;
@@ -91,11 +92,12 @@ bool tempRequested = false;
 
 const int8_t enc_states[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 
-// --- FUNCTION PROTOTYPES ---
 void handleUI();
 void readSlowSensors();
 void sensorUITask(void *pvParameters);
 void ecgRadioTask(void *pvParameters);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void logDataToSD();
 
 void IRAM_ATTR encoderISR() {
     static uint8_t old_AB = 3; static int enc_val = 0;
@@ -117,6 +119,8 @@ void setup() {
     Wire.begin(I2C_SDA, I2C_SCL); Wire.setClock(400000); 
     display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
     
+    if(!SD.begin(SD_CS)) Serial.println("SD Card Mount Failed");
+
     dataMutex = xSemaphoreCreateMutex();
     memset(&patientData, 0, sizeof(patientData));
     patientData.patient_id = 1;
@@ -125,26 +129,39 @@ void setup() {
     ds18b20.begin(); ds18b20.setWaitForConversion(false); 
     if (particleSensor.begin(Wire, I2C_SPEED_FAST)) particleSensor.setup(60, 4, 2, 100, 411, 4096); 
 
-    // --- NON-BLOCKING WI-FI INITIALIZATION ---
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // fallback channel until Wi-Fi joins
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     if (esp_now_init() == ESP_OK) {
         esp_now_peer_info_t peerInfo = {};
         memcpy(peerInfo.peer_addr, CYD_MAC_ADDRESS, 6);
-        // FIX: channel = 0 tells ESP-NOW "use whatever channel the STA
-        // interface is currently on" instead of a fixed number. Once both
-        // this device and the CYD join the same Wi-Fi network, their
-        // radios are locked to the same channel automatically, so this
-        // peer entry stays valid across router channel changes with no
-        // manual re-adding needed.
         peerInfo.channel = 0;
         peerInfo.encrypt = false;
         esp_now_add_peer(&peerInfo);
     }
     
     mqttClient.setServer(MQTT_BROKER, 1883);
+    mqttClient.setCallback(mqttCallback);
+
+    if (MDNS.begin("conrad")) { Serial.println("MDNS responder started at conrad.local"); }
+    
+    server.on("/download", HTTP_GET, []() {
+        if (server.hasArg("date")) {
+            String date = server.arg("date");
+            String filename = "/" + date + ".csv";
+            if (SD.exists(filename)) {
+                File file = SD.open(filename, FILE_READ);
+                server.streamFile(file, "text/csv");
+                file.close();
+            } else {
+                server.send(404, "text/plain", "Data for this date not found on SD card.");
+            }
+        } else {
+            server.send(400, "text/plain", "Missing date parameter.");
+        }
+    });
+    server.begin();
 
     pinMode(ECG_LO_PLUS, INPUT); pinMode(ECG_LO_MINUS, INPUT);
     pinMode(ROTARY_CLK, INPUT_PULLUP); pinMode(ROTARY_DT, INPUT_PULLUP); pinMode(ROTARY_SW, INPUT_PULLUP);
@@ -156,25 +173,58 @@ void setup() {
     xTaskCreatePinnedToCore(ecgRadioTask, "ECG_RADIO", 8192, NULL, 2, NULL, 1);
 }
 
-// ============================================================
-// CORE 1: MAIN LOOP (Non-Blocking Wi-Fi & MQTT)
-// ============================================================
+void logDataToSD() {
+    DateTime now = rtc.now();
+    char filename[16];
+    // Format must match the HTML calendar exactly: /YYYY-MM-DD.csv
+    snprintf(filename, sizeof(filename), "/%04d-%02d-%02d.csv", now.year(), now.month(), now.day());
+
+    bool fileExists = SD.exists(filename);
+    File dataFile = SD.open(filename, FILE_APPEND);
+
+    if (dataFile) {
+        // Add headers to a new file
+        if (!fileExists) {
+            dataFile.println("Time,PatientID,Mode,HR(BPM),SpO2(%),Temp(C),ECG_Val,Leads_Off");
+        }
+        
+        char logBuffer[128];
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            snprintf(logBuffer, sizeof(logBuffer), "%02d:%02d:%02d,%d,%d,%d,%d,%.1f,%d,%d",
+                now.hour(), now.minute(), now.second(),
+                patientData.patient_id,
+                patientData.active_param,
+                patientData.heart_rate,
+                patientData.spo2,
+                patientData.temperature,
+                patientData.ecg_value,
+                patientData.ecg_leads_off ? 1 : 0);
+            xSemaphoreGive(dataMutex);
+            dataFile.println(logBuffer);
+        }
+        dataFile.close();
+    } else {
+        Serial.println("Failed to open SD file for appending.");
+    }
+}
+
 void loop() {
     static bool wifiWasConnected = false;
+    server.handleClient(); // Handle SD card web requests non-blockingly
     
     if (WiFi.status() == WL_CONNECTED) {
         if (!wifiWasConnected) {
             Serial.print("Bedside Wi-Fi connected, channel = ");
             Serial.println(WiFi.channel());
-            // FIX: no more delete/re-add peer dance — peerInfo.channel = 0
-            // set in setup() already tracks the current channel automatically.
             wifiWasConnected = true;
         }
         
         if (!mqttClient.connected()) {
             static unsigned long lastMqttAttempt = 0;
             if (millis() - lastMqttAttempt > 5000) {
-                mqttClient.connect("Bedside_Conrad"); 
+                if(mqttClient.connect("Bedside_Conrad")) {
+                    mqttClient.subscribe(MQTT_CMD_TOPIC);
+                }
                 lastMqttAttempt = millis();
             }
         } else {
@@ -184,24 +234,48 @@ void loop() {
         wifiWasConnected = false;
     }
 
+    // --- MQTT PUBLISH TIMER (Every 500ms) ---
     static unsigned long lastMqttTx = 0;
     if (millis() - lastMqttTx >= 500 && mqttClient.connected() && currentState == STATE_MEASURE) {
         if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            char payload[150];
-            snprintf(payload, sizeof(payload), "{\"patient_id\":%d,\"heart_rate\":%d,\"spo2\":%d,\"temperature\":%.1f,\"ecg_value\":%d}",
-                patientData.patient_id, patientData.heart_rate, patientData.spo2, patientData.temperature, patientData.ecg_value);
+            char payload[256];
+            snprintf(payload, sizeof(payload), 
+                "{\"patient_id\":%d,\"heart_rate\":%d,\"spo2\":%d,\"temperature\":%.1f,\"ecg_value\":%d,\"ecg_leads_off\":%d,\"active_param\":%d,\"reset_flag\":%d}",
+                patientData.patient_id, patientData.heart_rate, patientData.spo2, patientData.temperature, patientData.ecg_value, 
+                patientData.ecg_leads_off ? 1 : 0, patientData.active_param, patientData.reset_flag ? 1 : 0);
             mqttClient.publish(MQTT_TOPIC, payload);
             xSemaphoreGive(dataMutex);
         }
         lastMqttTx = millis();
     }
+
+    // --- SD CARD LOGGING TIMER (Every 5 seconds) ---
+    static unsigned long lastSDLog = 0;
+    if (millis() - lastSDLog >= 5000 && currentState == STATE_MEASURE) {
+        logDataToSD();
+        lastSDLog = millis();
+    }
     
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
-// ============================================================
-// CORE 0: SLOW SENSORS & UI TASK
-// ============================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    String msg = "";
+    for (int i = 0; i < length; i++) msg += (char)payload[i];
+    if (msg.indexOf("reset") >= 0) {
+        if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+            patientData.reset_flag = true;
+            esp_now_send(CYD_MAC_ADDRESS, (uint8_t*)&patientData, sizeof(patientData));
+            delay(20); 
+            patientData.reset_flag = false;
+            patientData.patient_id++; 
+            currentState = STATE_HOME;
+            uiNeedsUpdate = true;
+            xSemaphoreGive(dataMutex);
+        }
+    }
+}
+
 void sensorUITask(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     unsigned long lastClockUpdate = 0;
@@ -225,9 +299,6 @@ void sensorUITask(void *pvParameters) {
     }
 }
 
-// ============================================================
-// CORE 1: LIGHTNING FAST ECG & ESP-NOW TASK
-// ============================================================
 void ecgRadioTask(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(40);
@@ -247,9 +318,6 @@ void ecgRadioTask(void *pvParameters) {
     }
 }
 
-// ============================================================
-// HELPER FUNCTIONS (Running inside Core 0)
-// ============================================================
 void handleUI() {
     if (btnPressed) {
         portENTER_CRITICAL(&isrMux); btnPressed = false; portEXIT_CRITICAL(&isrMux);
@@ -271,9 +339,6 @@ void handleUI() {
                 if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
                     selectedParam = (ParamType)(menuIndex + 1); 
                     patientData.active_param = selectedParam;
-                    // FIX: zero out whichever vitals this new mode does NOT
-                    // measure, so a stale reading from the previous mode can
-                    // never be transmitted/displayed/alerted on again.
                     if (selectedParam != PARAM_BPM && selectedParam != PARAM_BOTH) patientData.heart_rate = 0;
                     if (selectedParam != PARAM_SPO2 && selectedParam != PARAM_BOTH) patientData.spo2 = 0;
                     if (selectedParam != PARAM_TEMP) patientData.temperature = 0;
@@ -374,7 +439,7 @@ void readSlowSensors() {
     }
 
     if (selectedParam == PARAM_TEMP) {
-        if (!tempRequested && currentMillis - lastTempRequest > 1000) {
+        if (!tempRequested && currentMillis - lastTempRequest > 1000) {j
             ds18b20.requestTemperatures(); lastTempRequest = currentMillis; tempRequested = true;
         } else if (tempRequested && currentMillis - lastTempRequest > 750) {
             float t = ds18b20.getTempCByIndex(0);

@@ -335,7 +335,7 @@ void uiTask(void *pv) {
 
         bool loOff = localCopy.ecg_leads_off && (localCopy.active_param == 5); // FIX: only matters during ECG mode
 
-        // --- ONE-SHOT AUDIO STATE MACHINE ---
+        // --- REPEATING AUDIO STATE MACHINE ---
         uint8_t target_alert = 0; // 0 = Stable State
         
         if (!connected) {
@@ -343,15 +343,20 @@ void uiTask(void *pv) {
         } else if (current_crit && current_alert > 0 && current_alert < 6) {
             target_alert = current_alert;
         } else if (loOff) {
-            target_alert = TRACK_LEADS_OFF; // FIX: was 0xFF, now uses the real track constant (6) consistently
+            target_alert = TRACK_LEADS_OFF;
         }
 
-        // Trigger Audio ONLY when the state officially changes
-        if (target_alert != lastAlertType) {
+        static uint32_t lastAudioPlayMs = 0;
+
+        // Trigger Audio when the state changes OR if 30 seconds have passed while in a critical state
+        if (target_alert != lastAlertType || 
+           (target_alert > 0 && target_alert <= 6 && (millis() - lastAudioPlayMs >= 30000))) {
+            
             if (target_alert >= 1 && target_alert <= 6) {
-                playAlert(target_alert); // Sends play command exactly once
-            } else if (target_alert == 99) {
-                dfPlayer.stop(); // Instantly silence if disconnected
+                playAlert(target_alert);
+                lastAudioPlayMs = millis(); // Reset the 30-second timer
+            } else if (target_alert == 99 || target_alert == 0) {
+                dfPlayer.stop(); // Silence if disconnected or stable
             }
             lastAlertType = target_alert;
         }
