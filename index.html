@@ -259,12 +259,12 @@ function updateUI(data) {
   if(data.reset_flag === 1) { clearDashboard(); return; }
 
   // Extract active parameters mapping from CYD logic
-  // 1=BPM, 2=SPO2, 3=BOTH, 4=TEMP, 5=ECG
+  // 1=BPM, 2=SPO2, 3=BOTH, 4=TEMP, 5=ECG, 6=ALL
   const ap = data.active_param || 0;
-  const checkHR   = (ap === 1 || ap === 3);
-  const checkSpO2 = (ap === 2 || ap === 3);
-  const checkTemp = (ap === 4);
-  const checkECG  = (ap === 5);
+  const checkHR   = (ap === 1 || ap === 3 || ap === 6);
+  const checkSpO2 = (ap === 2 || ap === 3 || ap === 6);
+  const checkTemp = (ap === 4 || ap === 6);
+  const checkECG  = (ap === 5 || ap === 6);
 
   const hrValEl = document.getElementById('hrVal'); const hrTextEl = document.getElementById('hrText');
   if (checkHR && data.heart_rate > 0) { hrValEl.textContent = data.heart_rate; hrTextEl.classList.add('active'); } 

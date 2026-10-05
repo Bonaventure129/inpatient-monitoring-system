@@ -2,7 +2,8 @@
  * ============================================================
  * PATIENT MONITORING SYSTEM — BEDSIDE UNIT (MAIN STATION)
  * FEATURES: Non-blocking WiFi, MQTT Web Commands, mDNS (conrad.local), 
- * Async SD Card WebServer, exhaustive payload JSON, and SD Card Logging.
+ * Async SD Card WebServer, exhaustive payload JSON, SD Card Logging, 
+ * and PARAM_ALL mode.
  * ============================================================
  */
 
@@ -46,7 +47,7 @@ uint8_t CYD_MAC_ADDRESS[] = {0x94, 0x51, 0xDC, 0x32, 0xA7, 0x30};
 #define I2C_SCL      22
 
 enum UIState { STATE_HOME, STATE_MENU, STATE_MEASURE };
-enum ParamType { PARAM_NONE = 0, PARAM_BPM, PARAM_SPO2, PARAM_BOTH, PARAM_TEMP, PARAM_ECG };
+enum ParamType { PARAM_NONE = 0, PARAM_BPM, PARAM_SPO2, PARAM_BOTH, PARAM_TEMP, PARAM_ECG, PARAM_ALL };
 
 typedef struct __attribute__((packed)) PatientPayload {
     uint8_t  patient_id;
@@ -69,7 +70,8 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 RTC_DS3231 rtc;
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
-MAX30105 particleSensor;j
+MAX30105 particleSensor;
+WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 WebServer server(80);
 
@@ -78,8 +80,8 @@ volatile bool btnPressed = false;
 volatile bool uiNeedsUpdate = true;
 UIState currentState = STATE_HOME;
 ParamType selectedParam = PARAM_NONE;
-const int MENU_ITEMS = 7;
-const char* menuStrings[] = {"Read BPM", "Read SpO2", "Read Both", "Read Temp", "Read ECG", "Reset Patient", "<- Home"};
+const int MENU_ITEMS = 8;
+const char* menuStrings[] = {"Read BPM", "Read SpO2", "Read Both", "Read Temp", "Read ECG", "Read All", "Reset Patient", "<- Home"};
 
 uint32_t irBuffer[100]; 
 uint32_t redBuffer[100];
@@ -306,7 +308,7 @@ void ecgRadioTask(void *pvParameters) {
     for(;;) {
         if (currentState == STATE_MEASURE) {
             if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
-                if (selectedParam == PARAM_ECG || selectedParam == PARAM_BOTH) {
+                if (selectedParam == PARAM_ECG || selectedParam == PARAM_BOTH || selectedParam == PARAM_ALL) {
                     patientData.ecg_leads_off = (digitalRead(ECG_LO_PLUS) || digitalRead(ECG_LO_MINUS));
                     patientData.ecg_value = analogRead(ECG_OUTPUT);
                 }
@@ -323,7 +325,7 @@ void handleUI() {
         portENTER_CRITICAL(&isrMux); btnPressed = false; portEXIT_CRITICAL(&isrMux);
         if (currentState == STATE_HOME) { currentState = STATE_MENU; menuIndex = 0; } 
         else if (currentState == STATE_MENU) {
-            if (menuIndex == 5) { 
+            if (menuIndex == 6) { 
                 if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
                     patientData.reset_flag = true;
                     esp_now_send(CYD_MAC_ADDRESS, (uint8_t*)&patientData, sizeof(patientData));
@@ -334,15 +336,15 @@ void handleUI() {
                 }
                 currentState = STATE_HOME; 
             } 
-            else if (menuIndex == 6) { currentState = STATE_HOME; } 
+            else if (menuIndex == 7) { currentState = STATE_HOME; } 
             else { 
                 if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
                     selectedParam = (ParamType)(menuIndex + 1); 
                     patientData.active_param = selectedParam;
-                    if (selectedParam != PARAM_BPM && selectedParam != PARAM_BOTH) patientData.heart_rate = 0;
-                    if (selectedParam != PARAM_SPO2 && selectedParam != PARAM_BOTH) patientData.spo2 = 0;
-                    if (selectedParam != PARAM_TEMP) patientData.temperature = 0;
-                    if (selectedParam != PARAM_ECG && selectedParam != PARAM_BOTH) {
+                    if (selectedParam != PARAM_BPM && selectedParam != PARAM_BOTH && selectedParam != PARAM_ALL) patientData.heart_rate = 0;
+                    if (selectedParam != PARAM_SPO2 && selectedParam != PARAM_BOTH && selectedParam != PARAM_ALL) patientData.spo2 = 0;
+                    if (selectedParam != PARAM_TEMP && selectedParam != PARAM_ALL) patientData.temperature = 0;
+                    if (selectedParam != PARAM_ECG && selectedParam != PARAM_BOTH && selectedParam != PARAM_ALL) {
                         patientData.ecg_value = 0;
                         patientData.ecg_leads_off = false;
                     }
@@ -399,6 +401,13 @@ void handleUI() {
         else if (selectedParam == PARAM_BOTH) { display.setTextSize(1); display.setCursor(10, 28); display.print("BPM: "); display.print(b); display.setCursor(10, 40); display.print("SpO2: "); display.print(s); }
         else if (selectedParam == PARAM_TEMP) { display.setCursor(10, 32); display.print(localDisplay.temperature, 1); display.print(" C"); }
         else if (selectedParam == PARAM_ECG) { display.setTextSize(1); display.setCursor(10, 32); display.print("ECG: "); display.print(localDisplay.ecg_value); }
+        else if (selectedParam == PARAM_ALL) { 
+            display.setTextSize(1); 
+            display.setCursor(0, 24); display.print("HR:"); display.print(b);
+            display.setCursor(64, 24); display.print("O2:"); display.print(s);
+            display.setCursor(0, 36); display.print("T:"); display.print(localDisplay.temperature, 1);
+            display.setCursor(64, 36); display.print("ECG:"); display.print(localDisplay.ecg_value); 
+        }
         display.setTextSize(1); display.setCursor(0, 56); display.print("<- Press to stop");
     }
     display.display();
@@ -407,7 +416,7 @@ void handleUI() {
 void readSlowSensors() {
     unsigned long currentMillis = millis();
 
-    if (currentState == STATE_MEASURE && (selectedParam == PARAM_BPM || selectedParam == PARAM_SPO2 || selectedParam == PARAM_BOTH)) {
+    if (currentState == STATE_MEASURE && (selectedParam == PARAM_BPM || selectedParam == PARAM_SPO2 || selectedParam == PARAM_BOTH || selectedParam == PARAM_ALL)) {
         if (particleSensor.getIR() < 50000) {
             if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
                 patientData.heart_rate = 0; patientData.spo2 = 0;
@@ -438,8 +447,8 @@ void readSlowSensors() {
         }
     }
 
-    if (selectedParam == PARAM_TEMP) {
-        if (!tempRequested && currentMillis - lastTempRequest > 1000) {j
+    if (selectedParam == PARAM_TEMP || selectedParam == PARAM_ALL) {
+        if (!tempRequested && currentMillis - lastTempRequest > 1000) {
             ds18b20.requestTemperatures(); lastTempRequest = currentMillis; tempRequested = true;
         } else if (tempRequested && currentMillis - lastTempRequest > 750) {
             float t = ds18b20.getTempCByIndex(0);
