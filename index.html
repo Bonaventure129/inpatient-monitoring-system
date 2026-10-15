@@ -88,11 +88,14 @@
   /* ---- ECG SCOPE ---- */
   .ecg-card { grid-column: 1 / -1; position: relative; }
   canvas#ecgCanvas { width: 100%; height: 180px; display: block; border-radius: 8px; background: #02060c; border: 1px solid rgba(0, 255, 136, 0.1); }
+  
+  /* UPDATED: Non-blocking Leads Off Pill */
   #ecgOverlay {
-      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-      background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center;
-      color: var(--glow-yellow); font-weight: bold; font-size: 1.5rem; letter-spacing: 0.1em;
-      border-radius: var(--radius); text-shadow: 0 0 10px rgba(234, 179, 8, 0.5);
+      position: absolute; top: 20px; right: 20px; width: auto; height: auto;
+      background: rgba(234, 179, 8, 0.15); border: 1px solid var(--glow-yellow);
+      padding: 6px 12px; display: none; align-items: center; justify-content: center;
+      color: var(--glow-yellow); font-weight: bold; font-size: 0.85rem; letter-spacing: 0.1em;
+      border-radius: 6px; text-shadow: none; z-index: 10;
   }
 
   /* ---- ALERT BANNER ---- */
@@ -203,7 +206,7 @@
 </div>
 
 <footer>
-  Federal University of Technology Owerri · Mechatronics Engineering<br>
+  Federal University of Technology Owerri · Biomedical Engineering<br>
   MQTT over WebSocket · FreeRTOS
 </footer>
 
@@ -232,19 +235,22 @@ function drawECGFrame() {
   for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
   ctx.strokeStyle = 'rgba(0, 255, 136, 0.1)'; ctx.beginPath(); ctx.moveTo(0, H/2); ctx.lineTo(W, H/2); ctx.stroke();
 
-  if(!isLeadsOff) {
-      const eraseW = 15; ctx.fillStyle = 'rgba(2, 6, 12, 0.9)'; ctx.fillRect(ecgHead + 1, 0, eraseW, H);
-      ctx.beginPath(); ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      ctx.shadowColor = 'rgba(0, 255, 136, 0.8)'; ctx.shadowBlur = 8; ctx.moveTo(0, ecgData[0]);
-      for (let i = 1; i < W; i++) { let x = (ecgHead + i) % W; ctx.lineTo(i, ecgData[x]); }
-      ctx.stroke(); ctx.shadowBlur = 0;
-  }
+  // Draw the trace line constantly, but turn it red if leads are disconnected
+  const eraseW = 15; ctx.fillStyle = 'rgba(2, 6, 12, 0.9)'; ctx.fillRect(ecgHead + 1, 0, eraseW, H);
+  ctx.beginPath(); 
+  ctx.strokeStyle = isLeadsOff ? '#ef4444' : '#00ff88'; // Red if leads off, green if normal
+  ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.shadowColor = isLeadsOff ? 'rgba(239, 68, 68, 0.8)' : 'rgba(0, 255, 136, 0.8)'; 
+  ctx.shadowBlur = 8; ctx.moveTo(0, ecgData[0]);
+  for (let i = 1; i < W; i++) { let x = (ecgHead + i) % W; ctx.lineTo(i, ecgData[x]); }
+  ctx.stroke(); ctx.shadowBlur = 0;
+  
   requestAnimationFrame(drawECGFrame);
 }
 drawECGFrame();
 
 function pushECGValue(raw4095) {
-  if (isLeadsOff) return;
+  // We no longer exit early if leads are off. We still graph the analog reading.
   const padding = 20; 
   const newY = H - padding - Math.round((raw4095 / 4095) * (H - (padding * 2)));
   for(let i=0; i<3; i++) { ecgData[ecgHead] = newY; ecgHead = (ecgHead + 1) % W; }
@@ -348,10 +354,23 @@ function resetPatient() {
         client.publish(MQTT_CMD_TOPIC, JSON.stringify({command: "reset"}));
     }
 }
+
+// UPDATED: Pre-format the date from the HTML date picker (YYYY-MM-DD) into the clean YYMMDD format expected by the ESP32
 function downloadSDData() {
     const dateVal = document.getElementById('archiveDate').value;
     if(!dateVal) return alert("Please select a date first.");
-    window.open(`http://conrad.local/download?date=${dateVal}`, '_blank');
+    
+    const parts = dateVal.split('-');
+    if (parts.length === 3) {
+        // parts[0] is "2026", parts[1] is "10", parts[2] is "15"
+        const yy = parts[0].slice(-2);
+        const mm = parts[1];
+        const dd = parts[2];
+        const formattedDate = yy + mm + dd; 
+        window.open(`http://conrad.local/download?date=${formattedDate}`, '_blank');
+    } else {
+        window.open(`http://conrad.local/download?date=${dateVal}`, '_blank');
+    }
 }
 </script>
 </body>

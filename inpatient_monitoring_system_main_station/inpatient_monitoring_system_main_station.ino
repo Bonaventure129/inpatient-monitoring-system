@@ -3,7 +3,7 @@
  * PATIENT MONITORING SYSTEM — BEDSIDE UNIT (MAIN STATION)
  * FEATURES: Non-blocking WiFi, MQTT Web Commands, mDNS (conrad.local), 
  * Async SD Card WebServer, exhaustive payload JSON, SD Card Logging, 
- * and PARAM_ALL mode.
+ * PARAM_ALL mode, and Non-Blocking NTP RTC Synchronization.
  * ============================================================
  */
 
@@ -24,13 +24,19 @@
 #include <PubSubClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <time.h>
 
-// --- NETWORK CONFIG ---
+// --- NETWORK & NTP CONFIG ---
 const char* WIFI_SSID = "Jesus is Lord";
 const char* WIFI_PASS = "ROBOTICS";
 const char* MQTT_BROKER = "broker.hivemq.com";
 const char* MQTT_TOPIC = "conradrobotics/patient/1/vitals";
 const char* MQTT_CMD_TOPIC = "conradrobotics/patient/1/cmd";
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 3600; // UTC+1 for Nigeria
+const int   daylightOffset_sec = 0;
+bool ntpTimeSynced = false;
 
 uint8_t CYD_MAC_ADDRESS[] = {0x94, 0x51, 0xDC, 0x32, 0xA7, 0x30};
 
@@ -134,6 +140,8 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); // Initialize background NTP sync
+    
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     if (esp_now_init() == ESP_OK) {
         esp_now_peer_info_t peerInfo = {};
@@ -150,8 +158,32 @@ void setup() {
     
     server.on("/download", HTTP_GET, []() {
         if (server.hasArg("date")) {
-            String date = server.arg("date");
-            String filename = "/" + date + ".csv";
+            String rawDate = server.arg("date");
+            String filename = "";
+            char fBuf[16];
+            
+            // Format 1: YYYY-MM-DD from URL
+            if (rawDate.indexOf('-') != -1) {
+                int yyyy = rawDate.substring(0, 4).toInt();
+                int mm = rawDate.substring(5, 7).toInt();
+                int dd = rawDate.substring(8, 10).toInt();
+                snprintf(fBuf, sizeof(fBuf), "/%02d%02d%02d.csv", yyyy % 100, mm, dd);
+                filename = String(fBuf);
+            } 
+            // Format 2: MM / DD / YYYY from UI fallback
+            else if (rawDate.indexOf('/') != -1) {
+                rawDate.replace(" ", "");
+                int f1 = rawDate.indexOf('/');
+                int f2 = rawDate.lastIndexOf('/');
+                int mm = rawDate.substring(0, f1).toInt();
+                int dd = rawDate.substring(f1 + 1, f2).toInt();
+                int yyyy = rawDate.substring(f2 + 1).toInt();
+                snprintf(fBuf, sizeof(fBuf), "/%02d%02d%02d.csv", yyyy % 100, mm, dd);
+                filename = String(fBuf);
+            } else {
+                filename = "/" + rawDate + ".csv";
+            }
+            
             if (SD.exists(filename)) {
                 File file = SD.open(filename, FILE_READ);
                 server.streamFile(file, "text/csv");
@@ -178,14 +210,13 @@ void setup() {
 void logDataToSD() {
     DateTime now = rtc.now();
     char filename[16];
-    // Format must match the HTML calendar exactly: /YYYY-MM-DD.csv
-    snprintf(filename, sizeof(filename), "/%04d-%02d-%02d.csv", now.year(), now.month(), now.day());
+    // Saves file as YYMMDD.csv to avoid 8.3 character limitations on some FAT SD cards
+    snprintf(filename, sizeof(filename), "/%02d%02d%02d.csv", now.year() % 100, now.month(), now.day());
 
     bool fileExists = SD.exists(filename);
     File dataFile = SD.open(filename, FILE_APPEND);
 
     if (dataFile) {
-        // Add headers to a new file
         if (!fileExists) {
             dataFile.println("Time,PatientID,Mode,HR(BPM),SpO2(%),Temp(C),ECG_Val,Leads_Off");
         }
@@ -212,13 +243,31 @@ void logDataToSD() {
 
 void loop() {
     static bool wifiWasConnected = false;
-    server.handleClient(); // Handle SD card web requests non-blockingly
+    server.handleClient();
     
     if (WiFi.status() == WL_CONNECTED) {
         if (!wifiWasConnected) {
             Serial.print("Bedside Wi-Fi connected, channel = ");
             Serial.println(WiFi.channel());
             wifiWasConnected = true;
+        }
+
+        // --- NON-BLOCKING NTP TO DS3231 SYNC ---
+        if (!ntpTimeSynced) {
+            static unsigned long lastTimeCheck = 0;
+            if (millis() - lastTimeCheck > 2000) {
+                struct tm timeinfo;
+                // getLocalTime(0) checks instantly without blocking the main loop
+                if (getLocalTime(&timeinfo, 0)) {
+                    // tm_year is years since 1900. > 120 means the year is after 2020 (Valid NTP packet received)
+                    if (timeinfo.tm_year > 120) { 
+                        rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
+                        ntpTimeSynced = true;
+                        Serial.println("DS3231 RTC Synced successfully with NTP server!");
+                    }
+                }
+                lastTimeCheck = millis();
+            }
         }
         
         if (!mqttClient.connected()) {
@@ -236,7 +285,6 @@ void loop() {
         wifiWasConnected = false;
     }
 
-    // --- MQTT PUBLISH TIMER (Every 500ms) ---
     static unsigned long lastMqttTx = 0;
     if (millis() - lastMqttTx >= 500 && mqttClient.connected() && currentState == STATE_MEASURE) {
         if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -251,7 +299,6 @@ void loop() {
         lastMqttTx = millis();
     }
 
-    // --- SD CARD LOGGING TIMER (Every 5 seconds) ---
     static unsigned long lastSDLog = 0;
     if (millis() - lastSDLog >= 5000 && currentState == STATE_MEASURE) {
         logDataToSD();

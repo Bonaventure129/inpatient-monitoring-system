@@ -15,7 +15,7 @@
 #include <HardwareSerial.h>
 #include "DFRobotDFPlayerMini.h"
 
-// FIX: same network creds as bedside unit, so both devices lock to the
+// Same network creds as bedside unit, so both devices lock to the
 // same physical channel automatically (Wi-Fi + ESP-NOW coexistence).
 const char* WIFI_SSID = "Jesus is Lord";
 const char* WIFI_PASS = "ROBOTICS";
@@ -126,7 +126,7 @@ uint8_t prev_alert = 0xFF;
 bool    prev_conn  = false;
 uint8_t prev_min   = 99; 
 
-// FIX: track Wi-Fi connection state for non-blocking association
+// Track Wi-Fi connection state for non-blocking association
 bool wifiWasConnected = false;
 
 TaskHandle_t hUI   = nullptr;
@@ -138,7 +138,7 @@ TaskHandle_t hData = nullptr;
 void IRAM_ATTR onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
 void uiTask(void *pv);
 void dataTask(void *pv);
-void netTask(void *pv); // FIX: new task for non-blocking Wi-Fi join
+void netTask(void *pv); 
 void drawSplash();
 void drawStaticUI();
 void drawHeader(bool connected);
@@ -162,18 +162,18 @@ void setup() {
     setRGB(false, false, true);  
 
     WiFi.mode(WIFI_STA);
+    WiFi.disconnect(); 
     delay(200);
-    esp_wifi_start();
     
     esp_wifi_set_max_tx_power(8); 
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE); // fallback until Wi-Fi joins
+    esp_wifi_set_ps(WIFI_PS_NONE); // FIX: Disabled power savings to stop interrupts from crashing audio
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE); 
 
     if (esp_now_init() == ESP_OK) {
         esp_now_register_recv_cb(onDataRecv);
     }
 
-    // FIX: kick off non-blocking Wi-Fi join so ESP-NOW keeps working meanwhile
+    // Kick off non-blocking Wi-Fi join so ESP-NOW keeps working meanwhile
     WiFi.begin(WIFI_SSID, WIFI_PASS);
 
     lcd.init();
@@ -193,9 +193,10 @@ void setup() {
     drawStaticUI();
     drawHeader(false);
 
-    xTaskCreatePinnedToCore(uiTask,   "UI",   16000, nullptr, 2, &hUI,   0);
+    // FIX: Moved uiTask to Core 1 so display/audio doesn't collide with WiFi on Core 0
+    xTaskCreatePinnedToCore(uiTask,   "UI",   16000, nullptr, 2, &hUI,   1); 
     xTaskCreatePinnedToCore(dataTask, "DATA",  4096, nullptr, 1, &hData, 1);
-    xTaskCreatePinnedToCore(netTask,  "NET",   4096, nullptr, 1, nullptr, 1); // FIX
+    xTaskCreatePinnedToCore(netTask,  "NET",   4096, nullptr, 1, nullptr, 1); 
 
     setRGB(false, false, false);
 }
@@ -205,7 +206,7 @@ void loop() {
 }
 
 // ============================================================
-// FIX: NON-BLOCKING WI-FI MONITOR
+// NON-BLOCKING WI-FI MONITOR
 // Once Wi-Fi associates, the radio's channel is locked to the AP's
 // channel automatically — matching the bedside unit as long as it
 // joins the same network. No manual channel juggling needed.
@@ -273,7 +274,7 @@ void uiTask(void *pv) {
             localCopy.temperature = 0;
             localCopy.ecg_value = 0;
             localCopy.ecg_leads_off = false;
-            localCopy.active_param = 0; // FIX: also clear active_param on reset
+            localCopy.active_param = 0;
             localCopy.reset_flag = false;
             
             drawStaticUI(); 
@@ -295,7 +296,7 @@ void uiTask(void *pv) {
         bool current_crit = false;
         uint8_t current_alert = 0;
         
-        // FIX: gate every check by which parameter is actually being measured,
+        // Gate every check by which parameter is actually being measured,
         // so stale HR/SpO2/Temp values left over from a previous mode can
         // never trigger a false alert.
         if (connected) {
@@ -333,7 +334,7 @@ void uiTask(void *pv) {
             prev_alert = current_alert;
         }
 
-        bool loOff = localCopy.ecg_leads_off && (localCopy.active_param == 5); // FIX: only matters during ECG mode
+        bool loOff = localCopy.ecg_leads_off && (localCopy.active_param == 5); 
 
         // --- REPEATING AUDIO STATE MACHINE ---
         uint8_t target_alert = 0; // 0 = Stable State
@@ -525,7 +526,7 @@ void updateAlertPanel(bool crit, uint8_t alertT, bool connected) {
         lcd.setTextColor(C_ALERT_TXT, C_ALERT_BG); lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextDatum(MC_DATUM);
         lcd.drawString("! ALERT !", SB_X + SB_W/2, panelY + 14); lcd.setFont(&fonts::FreeSans9pt7b);
         lcd.drawString(alertMsgs[alertT], SB_X + SB_W/2, panelY + 32);
-    } else if (localCopy.ecg_leads_off && connected && localCopy.active_param == 5) { // FIX: gate by active_param too
+    } else if (localCopy.ecg_leads_off && connected && localCopy.active_param == 5) {
         lcd.fillRect(SB_X, panelY, SB_W, panelH, 0x431407); lcd.drawRect(SB_X, panelY, SB_W, panelH, C_YELLOW);
         lcd.setTextColor(C_YELLOW, 0x431407); lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextDatum(MC_DATUM);
         lcd.drawString("LEADS OFF", SB_X + SB_W/2, panelY + 14); lcd.setFont(&fonts::FreeSans9pt7b);
@@ -567,7 +568,6 @@ void sweepECG() {
     }
 }
 
-// FIX: added case 6 so leads-off audio actually plays (previously fell to default: return)
 void playAlert(uint8_t type) {
     int track = 0;
     switch (type) {
@@ -576,7 +576,7 @@ void playAlert(uint8_t type) {
         case 3: track = TRACK_SPO2_LOW; break; 
         case 4: track = TRACK_TEMP_LOW; break;
         case 5: track = TRACK_TEMP_HIGH; break; 
-        case 6: track = TRACK_LEADS_OFF; break; // FIX: was missing
+        case 6: track = TRACK_LEADS_OFF; break; 
         default: return;
     }
     dfPlayer.play(track);
